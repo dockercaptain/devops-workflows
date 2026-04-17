@@ -1,0 +1,567 @@
+name: CD
+
+on:
+  workflow_call:
+    inputs:
+      repository_name:
+        description: "Target Repository"
+        type: string
+        required: true
+      repository_ref:
+        description: "Target Branch/Ref"
+        type: string
+        required: true
+      tag:
+        description: "Tag for the deployment"
+        type: string
+        required: true
+      environment:
+        description: "Environment to deploy to"
+        type: string
+        required: true
+      organization:
+        description: "Organisation"
+        type: string
+        required: false
+        default: "ORG1"
+      cluster_name:
+        description: "AKS Cluster Name"
+        type: string
+        required: false
+      cluster_resource_group:
+        description: "AKS Cluster Resource Group"
+        type: string
+        required: false
+      deployment_url:
+        description: "Deployment URL/Hostname"
+        type: string
+        required: false
+        default: ""
+      helmInput:
+        description: "Additional Helm arguments"
+        type: string
+        required: false
+        default: ""
+      gatewayName:
+        description: "Update GW if needed"
+        type: string
+        required: false
+        default: ""
+      run_ct:
+        description: "User choice to trigger CT"
+        type: boolean
+        required: false
+        default: false
+    secrets:
+      REGISTRY_LOGIN_SERVER:
+        required: true
+      GH_PAGES_USERNAME:
+        required: true
+      CT_GH_PAT:
+        required: false
+      AZURE_CLIENT_ID:
+        required: true
+      AZURE_CLIENT_SECRET:
+        required: true
+      AZURE_SUBSCRIPTION_ID:
+        required: true
+      AZURE_TENANT_ID:
+        required: true
+  workflow_dispatch:
+    inputs:
+      repository_name:
+        description: "Target Repository"
+        type: string
+        required: true
+      repository_ref:
+        description: "Target Branch/Ref"
+        type: string
+        required: true
+      tag:
+        description: "Tag for the deployment"
+        type: string
+        required: true
+      environment:
+        description: "Environment to deploy to"
+        type: string
+        required: true
+      cluster_name:
+        description: "AKS Cluster Name"
+        type: string
+        required: true
+      cluster_resource_group:
+        description: "AKS Cluster Resource Group"
+        type: string
+        required: true
+      deployment_url:
+        description: "Deployment URL/Hostname"
+        type: string
+        required: false
+      helmInput:
+        description: "Additional Helm arguments"
+        type: string
+        required: false
+      gatewayName:
+        description: "Update GW if needed"
+        type: string
+        required: false
+        default: ""
+      run_ct:
+        description: "User choice to trigger CT"
+        type: boolean
+        required: false
+        default: false
+
+jobs:
+  deploy_to_k8:
+    name: "Deployment to kubernetes cluster"
+    outputs:
+      image_name: ${{ steps.set_vars.outputs.image_name }}
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [ubuntu-latest]
+    runs-on: prod
+    environment: ${{ inputs.environment }}
+    if: inputs.environment != 'prod' && inputs.environment != 'production'
+    env:
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+      AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+
+    steps:
+      - name: Set up kubelogin for non-interactive login
+        run: |
+          curl -LO https://github.com/Azure/kubelogin/releases/download/v0.0.9/kubelogin-linux-amd64.zip
+          sudo unzip -jo kubelogin-linux-amd64.zip -d /usr/local/bin
+          rm -f kubelogin-linux-amd64.zip
+          kubelogin --version
+
+      - name: Setting Image and Release Name
+        id: set_vars
+        run: |
+          REPO_NAME="${{ inputs.repository_name }}"
+          TAG_NAME="${{ inputs.tag }}"
+          ENV_NAME="${{ inputs.environment }}"
+
+          # Ensure lower case
+          REPO_NAME=$(echo ${REPO_NAME} | tr '[:upper:]' '[:lower:]')
+          
+          # Set Release Name logic
+          if [[ "${ENV_NAME}" == "prod" || "${ENV_NAME}" == "production" ]]; then
+             RELEASE_NAME="release-${REPO_NAME}"
+          else
+             RELEASE_NAME="release-${REPO_NAME}-${ENV_NAME}"
+          fi
+          
+          # Set Image Name (Just the repo name, tag is separate)
+          # Note: User requested "image_name should be repo-name:input_tag"
+          # Depending on how IMAGE_NAME is used:
+          # If used for docker push/pull: repo:tag
+          # If used for helm image.repository: just repo (and image.tag is set separately)
+          # Current helm command uses separate image.repository and image.tag
+          IMAGE_NAME="${REPO_NAME}"
+
+          echo "RELEASE_NAME=${RELEASE_NAME}" >> $GITHUB_ENV
+          echo "IMAGE_NAME=${IMAGE_NAME}" >> $GITHUB_ENV
+          echo "ENVIRONMENT_NAME=${ENV_NAME}" >> $GITHUB_ENV
+          echo "image_name=${IMAGE_NAME}" >> $GITHUB_OUTPUT
+        env:
+          BRANCH_NAME: ${{ inputs.repository_ref }}
+
+      - name: Login Azure
+        uses: azure/login@v2
+        with:
+          creds: '{"clientId":"${{ env.AZURE_CLIENT_ID }}","clientSecret":"${{ env.AZURE_CLIENT_SECRET }}","subscriptionId":"${{ env.AZURE_SUBSCRIPTION_ID }}","tenantId":"${{ env.AZURE_TENANT_ID }}"}'
+
+      - name: Check out code
+        uses: actions/checkout@v4
+        with:
+          repository: "${{ inputs.organization }}/${{ inputs.repository_name }}"
+          # token: "${{ secrets.PAT_TOKEN }}"
+          ref: "${{ inputs.repository_ref }}"
+
+      - name: Setting up aks context
+        run: |
+          az aks get-credentials --resource-group "${{ vars.cluster_resource_group }}" --name "${{ vars.cluster_name }}" --admin
+          kubelogin convert-kubeconfig -l spn --client-id "${{ env.AZURE_CLIENT_ID }}"  --client-secret "${{ env.AZURE_CLIENT_SECRET }}"
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        id: install
+      
+      - name: Add Helm repository
+        run: |
+          helm repo add charty "https://raw.githubusercontent.com/ORG1/charty/gh-pages/" --username ${{ secrets.GH_PAGES_USERNAME }} --password ${{ secrets.CT_GH_PAT }}
+      
+      - name: Update Helm repositories
+        run: |
+          helm repo update
+      
+      - name: Deploy with Helm
+        run: |
+          helm upgrade --install ${{ env.RELEASE_NAME }} charty/digital-platform-deployer-helm \
+            --namespace actions-runner-system \
+            --create-namespace \
+            -f ./configs/values.yml \
+            --set image.repository=${{ secrets.REGISTRY_LOGIN_SERVER }}/${{ env.IMAGE_NAME }} \
+            --set image.tag=${{ inputs.tag }} \
+            --set environment=${{ env.ENVIRONMENT_NAME }} \
+            --set targetBranch=${{ inputs.repository_ref }} \
+            --set hostname=${{ vars.deployment_url }} \
+            --set clusterName=${{ vars.cluster_name }} \
+            --set gatewayName=${{ vars.GATEWAY_NAME }} \
+            --server-side=false
+    
+  # wait_readiness:
+  #   needs:
+  #     - deploy_to_k8
+  #     # - extract_input
+  #     # - output_variable
+  #   runs-on: prod
+  #   environment: ${{ inputs.environment }}
+  #   env:
+  #     AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+  #     AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+  #     AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+  #     AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+  #   steps:
+  #     - name: Set up kubelogin for non-interactive login
+  #       run: |
+  #         curl -LO https://github.com/Azure/kubelogin/releases/download/v0.0.9/kubelogin-linux-amd64.zip
+  #         sudo unzip -jo kubelogin-linux-amd64.zip -d /usr/local/bin
+  #         rm -f kubelogin-linux-amd64.zip
+  #         kubelogin --version
+
+  #     - name: Login Azure
+  #       uses: azure/login@v2
+  #       with:
+  #         creds: '{"clientId":"${{ env.AZURE_CLIENT_ID }}","clientSecret":"${{ env.AZURE_CLIENT_SECRET }}","subscriptionId":"${{ env.AZURE_SUBSCRIPTION_ID }}","tenantId":"${{ env.AZURE_TENANT_ID }}"}'
+
+  #     - name: Setting up aks context
+  #       run: |
+  #         az aks get-credentials --resource-group "${{ vars.cluster_resource_group }}" --name "${{ vars.cluster_name }}" --admin
+  #         kubelogin convert-kubeconfig -l spn --client-id "${{ env.AZURE_CLIENT_ID }}"  --client-secret "${{ env.AZURE_CLIENT_SECRET }}"
+
+
+  #     - name: Wait for application's readiness(max 5 minute)
+  #       run: |
+  #         echo "Ensuring whether the latest changes are reflecting..."
+  #         export DEPLOYMENT="${{ needs.output_variable.outputs.image_name }}"
+  #         export NAMESPACE="${{ needs.output_variable.outputs.image_name }}"
+    
+  #         for i in {1..30}; do
+  #           LATEST_RS=$(kubectl get rs -n "$NAMESPACE" \
+  #             -l app="$DEPLOYMENT" \
+  #             --sort-by=.metadata.creationTimestamp \
+  #             -o jsonpath="{.items[*].metadata.name}" | awk '{print $NF}')
+    
+  #           if [ -z "$LATEST_RS" ]; then
+  #             echo "⚠️ No ReplicaSet found yet. Retrying in 10 seconds..."
+  #             sleep 10
+  #             continue
+  #           fi
+    
+  #           READY_REPLICAS=$(kubectl get rs "$LATEST_RS" -n "$NAMESPACE" -o jsonpath="{.status.readyReplicas}")
+  #           READY_REPLICAS=${READY_REPLICAS:-0}
+    
+  #           if [ "$READY_REPLICAS" -ne 0 ]; then
+  #             echo "✅ Latest ReplicaSet $LATEST_RS is ready."
+  #             exit 0
+  #           else
+  #             echo "⚠️ Latest ReplicaSet $LATEST_RS is not ready yet. Retrying in 10 seconds..."
+  #             sleep 10
+  #           fi
+  #         done
+    
+  #         echo "❌ Timeout reached. Latest ReplicaSet $LATEST_RS is not ready. Aborting."
+  #         exit 1  
+          
+  fetch_vault_secrets:
+    name: "Fetch Dynamic Secrets from Vault"
+    runs-on: prod
+    environment: ${{ inputs.environment }}
+    needs:
+       - deploy_to_k8
+       - deploy_to_prod
+    if: |
+      always() &&
+      inputs.run_ct == true &&
+      (needs.deploy_to_k8.result == 'success' || needs.deploy_to_prod.result == 'success')
+    outputs:
+      app_secrets: ${{ steps.get_secrets.outputs.app_secrets }}
+    steps: 
+      - name: Debug Image Name
+        run: |
+          # Accessing the output from the needed job
+          echo "DEBUG → IMAGE_NAME='${{ needs.deploy_to_k8.outputs.image_name || needs.deploy_to_prod.outputs.image_name }}'"
+  
+      - name: Install Vault CLI and jq
+        id: get_secrets
+        shell: bash
+        env:
+          VAULT_SKIP_VERIFY: "true"
+          VAULT_TOKEN: ${{ inputs.environment == 'prod' && secrets.VAULT_ROOT_TOKEN_ENT_PROD || secrets.VAULT_ROOT_TOKEN_ENT_NPROD }}
+          IMAGE_NAME: ${{ inputs.environment == 'prod' && format('{0}', needs.deploy_to_k8.outputs.image_name || needs.deploy_to_prod.outputs.image_name) || format('{0}-{1}', needs.deploy_to_k8.outputs.image_name || needs.deploy_to_prod.outputs.image_name, inputs.environment) }}
+          VAULT_ADDR: ${{ inputs.environment == 'prod' && 'https://vault.quantautomate.com' || 'https://vault.wescodevops.com' }}
+          VAULT_MOUNT: ${{ inputs.environment }}
+        run: |
+          # Install tools only if missing (skip slow apt update)
+          echo "Checking required tools..."
+          NEED_INSTALL=false
+          for tool in jq unzip curl; do
+            if ! command -v $tool &>/dev/null; then
+              NEED_INSTALL=true
+              break
+            fi
+          done
+          if [ "$NEED_INSTALL" = true ]; then
+            echo "Installing missing tools..."
+            sudo apt update && sudo apt install -y jq unzip curl
+          else
+            echo "✅ jq, unzip, curl already installed — skipping apt update"
+          fi
+  
+          VAULT_VERSION="1.15.4"
+          ZIP_FILE="vault_${VAULT_VERSION}_linux_amd64.zip"
+
+          if ! command -v vault &>/dev/null || [ "$(vault --version 2>/dev/null | grep -oP '\d+\.\d+\.\d+')" != "$VAULT_VERSION" ]; then
+            echo "Downloading Vault CLI version $VAULT_VERSION..."
+            curl -fsSL -o /tmp/${ZIP_FILE} https://releases.hashicorp.com/vault/${VAULT_VERSION}/${ZIP_FILE}
+            echo "Installing Vault CLI..."
+            sudo unzip -o /tmp/${ZIP_FILE} -d /usr/local/bin
+            sudo chmod +x /usr/local/bin/vault
+          else
+            echo "✅ Vault $VAULT_VERSION already installed — skipping download"
+          fi
+  
+          echo "Vault installed at: $(which vault)"
+          vault --version
+
+          # The VAULT_TOKEN is already set correctly via the step-level env: block above.
+          # Do NOT override it here.
+
+          # Verify token is not empty
+          echo "Token length: ${#VAULT_TOKEN}"
+          set +x
+          
+          echo "check FOR condition ####"
+          echo "Using VAULT_MOUNT=$VAULT_MOUNT, IMAGE_NAME=$IMAGE_NAME"
+          for path in $(vault kv list -mount=$VAULT_MOUNT / 2>&1 || true); do
+            vault kv list -mount=$VAULT_MOUNT "$path" 2>/dev/null | sed "s|^|$VAULT_MOUNT/$path|" | grep -i "$IMAGE_NAME" || true
+          done
+          # Fetch secrets from vault
+          VAULT_PATH=${{ env.IMAGE_NAME }}
+          echo "Fetching secrets from mount=$VAULT_MOUNT path=$VAULT_PATH"
+          
+          VAULT_RAW=$(vault kv get -mount=$VAULT_MOUNT -format=json "$VAULT_PATH" 2>&1) || {
+            echo "❌ vault kv get failed. Output:"
+            echo "$VAULT_RAW"
+            echo "Check: Does mount '$VAULT_MOUNT' and path '$VAULT_PATH' exist in vault at $VAULT_ADDR?"
+            exit 1
+          }
+          
+          SECRETS_JSON=$(echo "$VAULT_RAW" | jq -c '.data.data')
+          echo "✅ Secrets fetched successfully"
+          echo "::add-mask::$SECRETS_JSON"
+
+          # Encode and pass to next workflow
+          ENCODED_SECRETS=$(echo "$SECRETS_JSON" | base64 | tr -d '\n')
+          echo "app_secrets=$ENCODED_SECRETS" >> $GITHUB_OUTPUT
+
+  # call_wdp-service-fta:
+  #   name: "Call Remote IFS-IAM-FTA CT (Vault Enabled)"
+  #   needs:
+  #     - fetch_vault_secrets
+  #     # - output_variable
+  #     - deploy_to_k8
+  #     # - wait_readiness
+  #   if: ${{ needs.deploy_to_k8.outputs.image_name }} == 'wdp-service'
+  #   uses: ORG1/IFS-IAM-FTA/.github/workflows/testaction.yml@ct-impl
+  #   with:
+  #     vault_secrets_json: ${{ needs.fetch_vault_secrets.outputs.app_secrets }}
+  #     # deployed_url: ${{ inputs.deployment_url }}
+  #     # deployed_url: ${{ needs.output_variable.outputs.deployment_url }}
+  #   secrets:
+  #     CT_GH_PAT: ${{ inputs.pat_token }}
+
+  # call_cmp-device-service-fta:
+  #   name: "Call Remote cmp-device-service CT(Vault Enabled)"
+  #   needs:
+  #     - fetch_vault_secrets
+  #     # - extract_input
+  #     # - output_variable
+  #     - deploy_to_k8
+  #     # - wait_readiness
+  #       # 🎯 CONDITION: ONLY run this high-security job for 'wdp-service'
+  #   if: ${{ needs.extract_input.outputs.repository_name == 'cmp-device-service' }}
+  #   uses: ORG1/cmp-device-service-fta/.github/workflows/testaction.yml@main
+  #   with:
+  #     # Pass the fetched JSON string as an INPUT
+  #     vault_secrets_json: ${{ needs.fetch_vault_secrets.outputs.app_secrets }}
+  #     deployed_url: ${{ needs.output_variable.outputs.deployment_url }}
+  #   secrets:
+  #     CT_GH_PAT: ${{ inputs.pat_token }}
+
+
+  # call_cmp-alert-service-fta:
+  #   name: "Call Remote cmp-alert-service-fta CT(Vault Enabled)"
+  #   needs:
+  #     - fetch_vault_secrets
+  #     - deploy_to_k8
+  #     - deploy_to_prod
+  #   if: |
+  #     always() &&
+  #     inputs.run_ct == true &&
+  #     needs.fetch_vault_secrets.result == 'success' &&
+  #     (needs.deploy_to_k8.result == 'success' || needs.deploy_to_prod.result == 'success') &&
+  #     (needs.deploy_to_k8.outputs.image_name || needs.deploy_to_prod.outputs.image_name) == 'cmp-alert-service'
+  #   uses: ORG1/cmp-alert-service-fta/.github/workflows/testaction.yml@main
+  #   with:
+  #     vault_secrets_json: ${{ needs.fetch_vault_secrets.outputs.app_secrets }}
+  #   secrets:
+  #     CT_GH_PAT: ${{ secrets.CT_GH_PAT }}
+  call_java-mock-api-test-fta:
+    name: "Call Remote java-mock-api-test CT(Vault Enabled)"
+    needs:
+      - fetch_vault_secrets
+      - deploy_to_k8
+      - deploy_to_prod
+    if: |
+      inputs.run_ct == true &&
+      needs.fetch_vault_secrets.result == 'success' &&
+      needs.fetch_vault_secrets.outputs.app_secrets != '' &&
+      (
+        needs.deploy_to_k8.result == 'success' ||
+        needs.deploy_to_prod.result == 'success'
+      ) &&
+      (
+        needs.deploy_to_k8.outputs.image_name == 'java-mock-api' ||
+        needs.deploy_to_prod.outputs.image_name == 'java-mock-api'
+      )
+    uses: ORG1/java-mock-api-test-fta/.github/workflows/testaction.yml@main
+    with:
+      vault_secrets_json: ${{ needs.fetch_vault_secrets.outputs.app_secrets }}
+    secrets:
+      CT_GH_PAT: ${{ secrets.CT_GH_PAT }}
+      
+  deploy_to_prod:
+    name: "Deployment to prod kubernetes cluster"
+    outputs:
+      image_name: ${{ steps.set_vars.outputs.image_name }}
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [ubuntu-latest]
+    runs-on: prod
+    environment: ${{ inputs.environment }}
+    if: inputs.environment == 'prod' #|| inputs.environment == 'production'
+    env:
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_PROD_CLIENT_ID }}
+      AZURE_CLIENT_SECRET: ${{ secrets.AZURE_PROD_CLIENT_SECRET }}
+      AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_PROD_SUBSCRIPTION_ID }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+
+    steps:
+      - name: Set up kubelogin for non-interactive login
+        run: |
+          curl -LO https://github.com/Azure/kubelogin/releases/download/v0.0.9/kubelogin-linux-amd64.zip
+          sudo unzip -jo kubelogin-linux-amd64.zip -d /usr/local/bin
+          rm -f kubelogin-linux-amd64.zip
+          kubelogin --version
+
+      - name: Setting Image and Release Name
+        id: set_vars  # <--- IMPORTANT: Add this ID
+        run: |
+          REPO_NAME=$(echo "${{ inputs.repository_name }}" | tr '[:upper:]' '[:lower:]')
+          ENV_NAME="${{ inputs.environment }}"
+          
+          # Set Release Name
+          if [[ "${ENV_NAME}" == "prod" || "${ENV_NAME}" == "production" ]]; then
+             RELEASE_NAME="release-${REPO_NAME}"
+          else
+             RELEASE_NAME="release-${REPO_NAME}-${ENV_NAME}"
+          fi
+          
+          IMAGE_NAME="${REPO_NAME}"
+
+          # Export to GITHUB_ENV (for this job)
+          echo "RELEASE_NAME=${RELEASE_NAME}" >> $GITHUB_ENV
+          echo "IMAGE_NAME=${IMAGE_NAME}" >> $GITHUB_ENV
+          echo "ENVIRONMENT_NAME=${ENV_NAME}" >> $GITHUB_ENV
+          
+          # Export to GITHUB_OUTPUT (for other jobs)
+          echo "image_name=${IMAGE_NAME}" >> $GITHUB_OUTPUT
+          
+
+      # - name: Setting Image and Release Name
+      #   id: set_vars  # <--- IMPORTANT: Add this ID
+      #   run: |
+      #     REPO_NAME="${{ inputs.repository_name }}"
+      #     TAG_NAME="${{ inputs.tag }}"
+      #     ENV_NAME="${{ inputs.environment }}"
+
+      #     # Ensure lower case
+      #     REPO_NAME=$(echo ${REPO_NAME} | tr '[:upper:]' '[:lower:]')
+          
+      #     # Set Release Name logic
+      #     if [[ "${ENV_NAME}" == "prod" || "${ENV_NAME}" == "production" ]]; then
+      #        RELEASE_NAME="release-${REPO_NAME}"
+      #     else
+      #        RELEASE_NAME="release-${REPO_NAME}-${ENV_NAME}"
+      #     fi
+          
+      #     # Set Image Name (Just the repo name, tag is separate)
+      #     IMAGE_NAME="${REPO_NAME}"
+
+      #     echo "RELEASE_NAME=${RELEASE_NAME}" >> $GITHUB_ENV
+      #     echo "IMAGE_NAME=${IMAGE_NAME}" >> $GITHUB_ENV
+      #     echo "ENVIRONMENT_NAME=${ENV_NAME}" >> $GITHUB_ENV
+          
+      #   env:
+      #     BRANCH_NAME: ${{ inputs.repository_ref }}
+
+      - name: Login Azure
+        uses: azure/login@v2
+        with:
+          creds: '{"clientId":"${{ env.AZURE_CLIENT_ID }}","clientSecret":"${{ env.AZURE_CLIENT_SECRET }}","subscriptionId":"${{ env.AZURE_SUBSCRIPTION_ID }}","tenantId":"${{ env.AZURE_TENANT_ID }}"}'
+
+      - name: Check out code
+        uses: actions/checkout@v4
+        with:
+          repository: "${{ inputs.organization }}/${{ inputs.repository_name }}"
+          # token: "${{ secrets.PAT_TOKEN }}"
+          ref: "${{ inputs.repository_ref }}"
+
+      - name: Setting up aks context
+        run: |
+          az aks get-credentials --resource-group "${{ vars.cluster_resource_group }}" --name "${{ vars.cluster_name }}" --admin
+          kubelogin convert-kubeconfig -l spn --client-id "${{ env.AZURE_CLIENT_ID }}"  --client-secret "${{ env.AZURE_CLIENT_SECRET }}"
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        id: install
+      
+      - name: Add Helm repository
+        run: |
+          helm repo add charty "https://raw.githubusercontent.com/ORG1/charty/gh-pages/" --username ${{ secrets.GH_PAGES_USERNAME }} --password ${{ secrets.CT_GH_PAT }}
+      
+      - name: Update Helm repositories
+        run: |
+          helm repo update
+      
+      - name: Deploy with Helm
+        run: |
+          helm upgrade --install ${{ env.RELEASE_NAME }} charty/digital-platform-deployer-helm \
+            --namespace actions-runner-system \
+            --create-namespace \
+            -f ./configs/values.yml \
+            --set image.repository=${{ secrets.PROD_ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }} \
+            --set image.tag=${{ inputs.tag }} \
+            --set environment=${{ env.ENVIRONMENT_NAME }} \
+            --set targetBranch=${{ inputs.repository_ref }} \
+            --set hostname=${{ vars.deployment_url }} \
+            --set clusterName=${{ vars.cluster_name }} \
+            --set gatewayName=${{ vars.GATEWAY_NAME }} \
+            --server-side=false
