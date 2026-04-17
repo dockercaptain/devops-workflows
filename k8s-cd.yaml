@@ -303,7 +303,7 @@ jobs:
         env:
           VAULT_SKIP_VERIFY: "true"
           VAULT_TOKEN: ${{ inputs.environment == 'prod' && secrets.VAULT_ROOT_TOKEN_ENT_PROD || secrets.VAULT_ROOT_TOKEN_ENT_NPROD }}
-          IMAGE_NAME: ${{ inputs.environment == 'prod' && format('{0}', needs.deploy_to_k8.outputs.image_name || needs.deploy_to_prod.outputs.image_name) || format('{0}-{1}', needs.deploy_to_k8.outputs.image_name || needs.deploy_to_prod.outputs.image_name, inputs.environment) }}
+          IMAGE_NAME: ${{ inputs.environment == 'prod' && needs.deploy_to_k8.outputs.image_name || format('{0}-{1}', needs.deploy_to_prod.outputs.image_name, inputs.environment) }}
           VAULT_ADDR: ${{ inputs.environment == 'prod' && 'https://vault.quantautomate.com' || 'https://vault.wescodevops.com' }}
           VAULT_MOUNT: ${{ inputs.environment }}
         run: |
@@ -338,21 +338,11 @@ jobs:
   
           echo "Vault installed at: $(which vault)"
           vault --version
-
-          # The VAULT_TOKEN is already set correctly via the step-level env: block above.
-          # Do NOT override it here.
-
-          # Verify token is not empty
           echo "Token length: ${#VAULT_TOKEN}"
-          set +x
           
-          echo "check FOR condition ####"
           echo "Using VAULT_MOUNT=$VAULT_MOUNT, IMAGE_NAME=$IMAGE_NAME"
-          for path in $(vault kv list -mount=$VAULT_MOUNT / 2>&1 || true); do
-            vault kv list -mount=$VAULT_MOUNT "$path" 2>/dev/null | sed "s|^|$VAULT_MOUNT/$path|" | grep -i "$IMAGE_NAME" || true
-          done
           # Fetch secrets from vault
-          VAULT_PATH=${{ env.IMAGE_NAME }}
+          VAULT_PATH="${IMAGE_NAME}"
           echo "Fetching secrets from mount=$VAULT_MOUNT path=$VAULT_PATH"
           
           VAULT_RAW=$(vault kv get -mount=$VAULT_MOUNT -format=json "$VAULT_PATH" 2>&1) || {
