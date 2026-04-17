@@ -421,12 +421,7 @@ jobs:
     if: |
       always() &&
       inputs.run_ct == true &&
-      needs.fetch_vault_secrets.result == 'success' &&
-      needs.fetch_vault_secrets.outputs.app_secrets != '' &&
-      (
-        (needs.deploy_to_k8.result == 'success' && needs.deploy_to_k8.outputs.image_name == 'java-mock-api') ||
-        (needs.deploy_to_prod.result == 'success' && needs.deploy_to_prod.outputs.image_name == 'java-mock-api')
-      )
+      needs.fetch_vault_secrets.result == 'success'
     uses: ORG1/java-mock-api-test-fta/.github/workflows/testaction.yml@main
     with:
       vault_secrets_json: ${{ needs.fetch_vault_secrets.outputs.app_secrets }}
